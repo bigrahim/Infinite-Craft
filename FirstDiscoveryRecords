@@ -1,35 +1,25 @@
--- stores who made each element first + who made each recipe first
--- one datastore key per element, all its recipes live inside it
-
 local DataStoreService = game:GetService("DataStoreService")
 local ElementRecipes = require(game.ServerStorage.Elements)
 
--- studio saves to the real store, use _test when testing
--- bump version if i wipe craft_cache.db
-local STORE_NAME = "ElementRecords_v1"
-local store = DataStoreService:GetDataStore(STORE_NAME)
+local storeName = "ElementRecords_v1"
+local store = DataStoreService:GetDataStore(storeName)
 
-local CACHE_SECONDS = 30
-local BUDGET_RESERVE = 3 -- keep some requests for inventory saves
+local cacheSeconds = 30
+local budgetReserve = 3
 
--- everything the other scripts can use goes in here
 local Records = {}
 
--- cache[key] = { record, fetched }
 local cache = {}
 
--- quick lookup instead of looping every time
-local STARTERS = {}
+local starters = {}
 for _, item in ipairs(ElementRecipes.BaseElements) do
-	STARTERS[string.lower(item.name)] = true
+	starters[string.lower(item.name)] = true
 end
 
 function Records.IsStarter(elementKey: string): boolean
-	return STARTERS[elementKey] == true
+	return starters[elementKey] == true
 end
 
--- sort so fire+water and water+fire give the same key
--- python sorts the same way
 function Records.PairKey(nameA: string, nameB: string): string
 	local a, b = string.lower(nameA), string.lower(nameB)
 	if a > b then
@@ -38,38 +28,31 @@ function Records.PairKey(nameA: string, nameB: string): string
 	return a .. ":" .. b
 end
 
--- save what we got so we dont ask again
 local function remember(elementKey: string, record)
 	cache[elementKey] = { record = record, fetched = os.clock() }
 end
 
--- wait if were out of datastore requests, give up after maxWait
 local function waitForBudget(maxWait: number): boolean
 	local started = os.clock()
-	while DataStoreService:GetRequestBudgetForRequestType(Enum.DataStoreRequestType.UpdateAsync) < BUDGET_RESERVE do
+	while DataStoreService:GetRequestBudgetForRequestType(Enum.DataStoreRequestType.UpdateAsync) < budgetReserve do
 		if os.clock() - started > maxWait then
 			return false
 		end
-		-- check every half second
 		task.wait(0.5)
 	end
 	return true
 end
 
--- called from the merge script after every merge
--- returns "first", "recipe", or nil
 function Records.Claim(player: Player, itemA, itemB, result): string?
 	local elementKey = string.lower(result.name)
 	local keyA, keyB = string.lower(itemA.name), string.lower(itemB.name)
 
-	-- ocean + water = ocean doesnt count
 	if elementKey == keyA or elementKey == keyB then
 		return nil
 	end
 
 	local pairKey = Records.PairKey(itemA.name, itemB.name)
 
-	-- already know this recipe exists, skip the datastore
 	local cached = cache[elementKey]
 	if cached and cached.record and cached.record.recipes and cached.record.recipes[pairKey] then
 		return nil
@@ -80,12 +63,10 @@ function Records.Claim(player: Player, itemA, itemB, result): string?
 		return nil
 	end
 
-	-- same order as the key
 	local first, second = itemA, itemB
 	if keyA > keyB then
 		first, second = itemB, itemA
 	end
-	-- time is utc, the card converts it to the players time zone
 	local newRecipe = {
 		a = first.name,
 		aEmoji = first.emoji,
@@ -96,26 +77,20 @@ function Records.Claim(player: Player, itemA, itemB, result): string?
 		time = os.time(),
 		notes = "",
 	}
-	-- starters get handled differently below
 	local isStarter = Records.IsStarter(elementKey)
 
-	-- these get set inside updateasync so i can read them after
 	local outcome = nil
 	local finalRecord = nil
 	local ok, err = pcall(function()
 		store:UpdateAsync(elementKey, function(current)
-			-- this can run twice so reset
 			outcome = nil
 			finalRecord = current
 
-			-- whatever i return in here is what gets saved
-			-- nobody made this yet
 			if current == nil then
 				local record = {
 					name = result.name,
 					emoji = result.emoji,
 					starter = isStarter or nil,
-					-- starters cant be "discovered"
 					firstRecipe = (not isStarter) and pairKey or nil,
 					recipes = { [pairKey] = newRecipe },
 				}
@@ -126,10 +101,9 @@ function Records.Claim(player: Player, itemA, itemB, result): string?
 
 			current.recipes = current.recipes or {}
 			if current.recipes[pairKey] then
-				return nil -- recipe taken, save nothing
+				return nil
 			end
 
-			-- new combo for an existing element
 			current.recipes[pairKey] = newRecipe
 			outcome = "recipe"
 			finalRecord = current
@@ -138,7 +112,6 @@ function Records.Claim(player: Player, itemA, itemB, result): string?
 	end)
 
 	if not ok then
-		-- datastore broke, dont give out a fake first
 		warn("[DiscoveryRecords] claim failed for", elementKey, pairKey, tostring(err))
 		return nil
 	end
@@ -146,11 +119,9 @@ function Records.Claim(player: Player, itemA, itemB, result): string?
 	return outcome
 end
 
--- used by the element card
 function Records.Get(elementKey: string)
 	local cached = cache[elementKey]
-	if cached and os.clock() - cached.fetched < CACHE_SECONDS then
-		-- still fresh, no request needed
+	if cached and os.clock() - cached.fetched < cacheSeconds then
 		return cached.record
 	end
 	local ok, value = pcall(function()
@@ -158,16 +129,76 @@ function Records.Get(elementKey: string)
 	end)
 	if not ok then
 		warn("[DiscoveryRecords] read failed for", elementKey, tostring(value))
-		return cached and cached.record -- old copy is better than nothing
+		return cached and cached.record
 	end
 	remember(elementKey, value)
 	return value
 end
 
--- text has to be filtered before this
--- returns "ok", "denied" or "error"
+function Records.Invalidate(elementKey: string)
+	cache[elementKey] = nil
+end
+
+function Records.HasRecipe(elementKey: string, pairKey: string): boolean
+	local record = Records.Get(elementKey)
+	return record ~= nil and record.recipes ~= nil and record.recipes[pairKey] ~= nil
+end
+
+function Records.GetRecipe(elementKey: string, pairKey: string)
+	local record = Records.Get(elementKey)
+	if not record or not record.recipes then
+		return nil
+	end
+	return record.recipes[pairKey]
+end
+
+function Records.GetFirstRecipe(elementKey: string)
+	local record = Records.Get(elementKey)
+	if not record or not record.firstRecipe then
+		return nil
+	end
+	return Records.GetRecipe(elementKey, record.firstRecipe)
+end
+
+function Records.GetFirstDiscoverer(elementKey: string)
+	local recipe = Records.GetFirstRecipe(elementKey)
+	if not recipe then
+		return nil
+	end
+	return recipe.userId, recipe.playerName
+end
+
+function Records.GetRecipeCount(elementKey: string): number
+	local record = Records.Get(elementKey)
+	if not record or not record.recipes then
+		return 0
+	end
+	local count = 0
+	for _ in pairs(record.recipes) do
+		count += 1
+	end
+	return count
+end
+
+function Records.GetRecipeList(elementKey: string)
+	local record = Records.Get(elementKey)
+	local list = {}
+	if not record or not record.recipes then
+		return list
+	end
+	for pairKey, recipe in pairs(record.recipes) do
+		table.insert(list, { pairKey = pairKey, recipe = recipe })
+	end
+	table.sort(list, function(left, right)
+		if left.recipe.time == right.recipe.time then
+			return left.pairKey < right.pairKey
+		end
+		return left.recipe.time < right.recipe.time
+	end)
+	return list
+end
+
 function Records.SaveNote(player: Player, elementKey: string, pairKey: string, text: string): string
-	-- notes can wait a little longer than claims
 	if not waitForBudget(5) then
 		return "error"
 	end
@@ -176,11 +207,9 @@ function Records.SaveNote(player: Player, elementKey: string, pairKey: string, t
 	local finalRecord = nil
 	local ok, err = pcall(function()
 		store:UpdateAsync(elementKey, function(current)
-			-- reset in case it reruns
 			allowed = false
 			finalRecord = current
 
-			-- only the person who made the recipe can edit it
 			local recipe = current and current.recipes and current.recipes[pairKey]
 			if not recipe or recipe.userId ~= player.UserId then
 				return nil
@@ -196,7 +225,6 @@ function Records.SaveNote(player: Player, elementKey: string, pairKey: string, t
 		return "error"
 	end
 	if finalRecord then
-		-- keep cache up to date so the card shows the new note
 		remember(elementKey, finalRecord)
 	end
 	return allowed and "ok" or "denied"
